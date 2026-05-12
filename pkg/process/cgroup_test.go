@@ -59,6 +59,44 @@ func TestSystemdAvailable(t *testing.T) {
 	t.Logf("systemd available: %v", available)
 }
 
+func TestReadProcStats(t *testing.T) {
+	stats, err := readProcStats(os.Getpid())
+	if err != nil {
+		t.Fatalf("Failed to read /proc stats: %v", err)
+	}
+
+	if stats.VmRSS <= 0 {
+		t.Error("Expected positive VmRSS")
+	}
+	if stats.VmHWM <= 0 {
+		t.Error("Expected positive VmHWM (peak RSS)")
+	}
+	if stats.VmHWM < stats.VmRSS {
+		t.Error("VmHWM (peak) should be >= VmRSS (current)")
+	}
+
+	t.Logf("Process memory: RSS=%s, Peak RSS (VmHWM)=%s",
+		FormatBytes(stats.VmRSS), FormatBytes(stats.VmHWM))
+}
+
+func TestReadStatsByPID_FallbackToProc(t *testing.T) {
+	reader := NewCgroupReader()
+	stats, err := reader.ReadStatsByPID(os.Getpid())
+	if err != nil {
+		t.Skipf("Could not read stats: %v", err)
+	}
+
+	// MemoryMax should be populated (either from cgroup or /proc VmHWM)
+	if stats.MemoryMax <= 0 {
+		t.Error("Expected positive MemoryMax (peak memory)")
+	}
+
+	t.Logf("Stats: Current=%s, Peak=%s, RSS=%s",
+		FormatBytes(stats.MemoryUsage),
+		FormatBytes(stats.MemoryMax),
+		FormatBytes(stats.MemoryRSS))
+}
+
 func TestParseMemoryStat(t *testing.T) {
 	content := `anon 12345678
 file 87654321

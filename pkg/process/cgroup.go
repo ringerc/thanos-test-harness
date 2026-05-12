@@ -54,12 +54,69 @@ func (r *CgroupReader) ReadStats(cgroupPath string) (*CgroupStats, error) {
 }
 
 // ReadStatsByPID reads cgroup stats for a process by PID.
+// Falls back to /proc/{pid}/status for per-process memory stats when
+// the process is in the root cgroup (where cgroup stats are shared).
 func (r *CgroupReader) ReadStatsByPID(pid int) (*CgroupStats, error) {
 	cgroupPath, err := r.getCgroupPathForPID(pid)
 	if err != nil {
 		return nil, err
 	}
-	return r.ReadStats(cgroupPath)
+
+	stats, err := r.ReadStats(cgroupPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// If process is in root cgroup, cgroup memory stats are shared across
+	// all processes. Fall back to /proc for per-process stats.
+	if cgroupPath == "/sys/fs/cgroup" || cgroupPath == "/sys/fs/cgroup/" {
+		procStats, procErr := readProcStats(pid)
+		if procErr == nil {
+			stats.MemoryMax = procStats.VmHWM
+			stats.MemoryRSS = procStats.VmRSS
+			stats.MemoryUsage = procStats.VmRSS // Best approximation
+		}
+	}
+
+	return stats, nil
+}
+
+// procStats holds memory stats from /proc/{pid}/status.
+type procStats struct {
+	VmPeak int64 // Peak virtual memory size
+	VmHWM  int64 // Peak resident set size ("high water mark")
+	VmRSS  int64 // Current resident set size
+}
+
+// readProcStats reads memory stats from /proc/{pid}/status.
+func readProcStats(pid int) (*procStats, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return nil, err
+	}
+
+	stats := &procStats{}
+	for _, line := range strings.Split(string(data), "\n") {
+		switch {
+		case strings.HasPrefix(line, "VmPeak:"):
+			stats.VmPeak = parseKBLine(line) * 1024
+		case strings.HasPrefix(line, "VmHWM:"):
+			stats.VmHWM = parseKBLine(line) * 1024
+		case strings.HasPrefix(line, "VmRSS:"):
+			stats.VmRSS = parseKBLine(line) * 1024
+		}
+	}
+	return stats, nil
+}
+
+// parseKBLine parses a line like "VmHWM:    12345 kB" and returns the numeric value.
+func parseKBLine(line string) int64 {
+	fields := strings.Fields(line)
+	if len(fields) >= 2 {
+		v, _ := strconv.ParseInt(fields[1], 10, 64)
+		return v
+	}
+	return 0
 }
 
 func (r *CgroupReader) readCgroupV2(path string, stats *CgroupStats) (*CgroupStats, error) {

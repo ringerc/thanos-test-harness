@@ -2,8 +2,11 @@ package process
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -227,4 +230,108 @@ func (m *Manager) ScopesEnabled() bool {
 	}
 	// If no components, check if systemd is available
 	return systemdAvailable()
+}
+
+// componentState holds persisted state for a component.
+type componentState struct {
+	Name      string          `json:"name"`
+	PID       int             `json:"pid"`
+	HTTPPort  int             `json:"http_port"`
+	GRPCPort  int             `json:"grpc_port"`
+	DataDir   string          `json:"data_dir"`
+	StartTime time.Time       `json:"start_time"`
+}
+
+// managerState holds persisted state for all components.
+type managerState struct {
+	Components []componentState `json:"components"`
+	SavedAt    time.Time        `json:"saved_at"`
+}
+
+func (m *Manager) stateFile() string {
+	return filepath.Join(m.baseDir, "harness-state.json")
+}
+
+// SaveState persists component state to disk.
+func (m *Manager) SaveState() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	state := managerState{
+		Components: make([]componentState, 0, len(m.components)),
+		SavedAt:    time.Now(),
+	}
+
+	for _, comp := range m.components {
+		state.Components = append(state.Components, componentState{
+			Name:      comp.Name,
+			PID:       comp.Scope.PID(),
+			HTTPPort:  comp.Config.HTTPPort,
+			GRPCPort:  comp.Config.GRPCPort,
+			DataDir:   comp.DataDir,
+			StartTime: comp.StartTime,
+		})
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal state: %w", err)
+	}
+
+	if err := os.WriteFile(m.stateFile(), data, 0644); err != nil {
+		return fmt.Errorf("write state file: %w", err)
+	}
+
+	return nil
+}
+
+// LoadState loads component state from disk and reconnects to running processes.
+func (m *Manager) LoadState() error {
+	data, err := os.ReadFile(m.stateFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No state file, nothing to load
+		}
+		return fmt.Errorf("read state file: %w", err)
+	}
+
+	var state managerState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("unmarshal state: %w", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, cs := range state.Components {
+		scope := NewScope("thanos-harness-" + cs.Name)
+		if err := scope.AttachToPID(cs.PID); err != nil {
+			continue // Process no longer running, skip
+		}
+
+		m.components[cs.Name] = &Component{
+			Name:      cs.Name,
+			Scope:     scope,
+			HTTPAddr:  fmt.Sprintf("http://localhost:%d", cs.HTTPPort),
+			DataDir:   cs.DataDir,
+			StartTime: cs.StartTime,
+			Config: ComponentConfig{
+				Name:       cs.Name,
+				HTTPPort:   cs.HTTPPort,
+				GRPCPort:   cs.GRPCPort,
+				Dir:        cs.DataDir,
+				HealthPath: "/-/ready",
+			},
+		}
+	}
+
+	return nil
+}
+
+// ClearState removes the state file.
+func (m *Manager) ClearState() error {
+	if err := os.Remove(m.stateFile()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

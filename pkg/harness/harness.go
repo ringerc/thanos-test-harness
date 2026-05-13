@@ -47,14 +47,23 @@ type Harness struct {
 }
 
 // New creates a new harness with the given configuration.
+// Automatically loads any existing state from a previous run.
 func New(cfg Config) (*Harness, error) {
 	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
 		return nil, fmt.Errorf("create base dir: %w", err)
 	}
 
+	mgr := process.NewManager(cfg.BaseDir)
+
+	// Try to load state from previous run
+	if err := mgr.LoadState(); err != nil {
+		// Log but don't fail - state loading is best-effort
+		fmt.Fprintf(os.Stderr, "Warning: failed to load state: %v\n", err)
+	}
+
 	h := &Harness{
 		config:  cfg,
-		manager: process.NewManager(cfg.BaseDir),
+		manager: mgr,
 
 		prometheusHTTPPort: cfg.BasePort,
 		sidecarHTTPPort:    cfg.BasePort + 1,
@@ -130,12 +139,20 @@ func (h *Harness) Start(ctx context.Context) error {
 		return fmt.Errorf("querier not ready: %w", err)
 	}
 
+	// Save state so other commands can find the running processes
+	if err := h.manager.SaveState(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save state: %v\n", err)
+	}
+
 	return nil
 }
 
 // Stop stops all components.
 func (h *Harness) Stop() error {
-	return h.manager.StopAll()
+	err := h.manager.StopAll()
+	// Clear state file since processes are stopped
+	h.manager.ClearState()
+	return err
 }
 
 // QueryResult holds query results and resource metrics.

@@ -97,6 +97,20 @@ func (s *Scope) PID() int {
 	return s.pid
 }
 
+// AttachToPID attaches to an existing process by PID (for state recovery).
+func (s *Scope) AttachToPID(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find process %d: %w", pid, err)
+	}
+	// Check if process is actually running by sending signal 0
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return fmt.Errorf("process %d not running: %w", pid, err)
+	}
+	s.pid = pid
+	return nil
+}
+
 // Running returns true if the process is still running.
 func (s *Scope) Running() bool {
 	if s.Cmd == nil || s.Cmd.Process == nil {

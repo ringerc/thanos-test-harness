@@ -84,11 +84,20 @@ func buildBinary(ctx context.Context, srcDir, name, pkg string, cfg Config) (str
 	// Build flags
 	var ldflags []string
 	var gcflags []string
+	var tags []string
+
+	// Thanos requires slicelabels tag for correct unsafe pointer handling in labelpb
+	if name == "thanos" {
+		tags = append(tags, "slicelabels")
+	}
 
 	if cfg.Debug {
 		gcflags = append(gcflags, "all=-N -l")
 	}
 
+	if len(tags) > 0 {
+		args = append(args, "-tags", strings.Join(tags, ","))
+	}
 	if len(ldflags) > 0 {
 		args = append(args, "-ldflags", strings.Join(ldflags, " "))
 	}

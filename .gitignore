@@ -3,3 +3,19 @@
 
 # Test artifacts
 /tmp/
+
+# Config secrets
+/.config/thanos/objstore.yaml
+
+# Lock files
+/.devcontainer/devcontainer-lock.json
+
+# Build outputs
+/bin/
+
+# Cloned repos
+/thanos/
+/thanos-parquet-gateway/
+/thanos-promql-engine/
+/thanos-prometheus/
+/spec-kit/

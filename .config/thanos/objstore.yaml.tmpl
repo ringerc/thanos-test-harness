@@ -1,0 +1,21 @@
+# minio config
+#
+# To use this, you'll need a minio container in the same docker network
+# as this container. Or if running on host network, a suitably listening
+# minio.
+#
+type: S3
+config:
+  bucket: BUCKET_NAME
+  # default for minio
+  region: us-east-1
+  endpoint: minio:9000
+  insecure: false
+  http_config:
+    tls_config:
+      # path relative to this file
+      # only required if custom CA cert used
+      ca_file: "ca-cert.pem"
+  aws_sdk_auth: false
+  access_key: ACCESS_KEY
+  secret_key: SECRET_KEY

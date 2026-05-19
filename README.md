@@ -29,6 +29,9 @@ go build -o thanos-harness ./cmd/thanos-harness
 # Or with explicit binary paths
 ./thanos-harness start --prometheus=/path/to/prometheus --thanos=/path/to/thanos
 
+# Start with per-component memory limit (OOM kills if exceeded)
+./thanos-harness start --memory-limit=1G
+
 # In another terminal, seed test data
 ./thanos-harness seed --series=10000 --duration=1h
 
@@ -51,6 +54,7 @@ go build -o thanos-harness ./cmd/thanos-harness
 
 - **Process isolation**: Each component runs in a separate systemd scope (when available)
 - **Cgroup accounting**: Per-component memory and CPU tracking
+- **Memory limits**: Optional per-component memory caps with OOM kill enforcement
 - **Data generation**: Configurable cardinality, info metrics for joins
 - **Query metrics**: Resource usage delta per query
 
@@ -62,6 +66,32 @@ When systemd is available, each component runs in a cgroup scope providing:
 - OOM kill detection
 
 Without systemd, falls back to process-level metrics via `/proc`.
+
+## Memory Limits
+
+Use `--memory-limit` to cap per-component memory:
+
+```bash
+./thanos-harness start --memory-limit=512M  # 512 MB per component
+./thanos-harness start --memory-limit=2G    # 2 GB per component
+```
+
+When a component exceeds its limit, it is OOM-killed. This prevents runaway queries from destabilizing the host. Requires cgroup v2 and sudo access for cgroup setup (processes run unprivileged after cgroup initialization).
+
+## Go Runtime Tuning
+
+Control Go garbage collection behavior:
+
+```bash
+# Set GOGC (default 100 = collect when heap doubles)
+./thanos-harness start --gogc=50   # More aggressive GC
+
+# Set GOMEMLIMIT soft memory target
+./thanos-harness start --gomemlimit=1G
+
+# Combine both for memory-constrained testing
+./thanos-harness start --memory-limit=2G --gomemlimit=1500M --gogc=50
+```
 
 ## Architecture
 

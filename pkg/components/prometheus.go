@@ -10,11 +10,12 @@ import (
 
 // PrometheusConfig holds Prometheus-specific configuration.
 type PrometheusConfig struct {
-	Name           string
-	DataDir        string
-	HTTPPort       int
-	ScrapeInterval string
-	ExternalLabels map[string]string
+	Name              string
+	DataDir           string
+	HTTPPort          int
+	ScrapeInterval    string
+	ExternalLabels    map[string]string
+	TSDBBlockDuration string // Min and max block duration (default 2h)
 }
 
 // DefaultPrometheusConfig returns default Prometheus configuration.
@@ -42,11 +43,16 @@ func (c PrometheusConfig) ToProcessConfig(prometheusBinary string) (process.Comp
 		return process.ComponentConfig{}, err
 	}
 
+	blockDuration := c.TSDBBlockDuration
+	if blockDuration == "" {
+		blockDuration = "2h"
+	}
+
 	args := []string{
 		"--config.file=" + configPath,
 		"--storage.tsdb.path=" + filepath.Join(c.DataDir, "tsdb"),
-		"--storage.tsdb.min-block-duration=2h",
-		"--storage.tsdb.max-block-duration=2h",
+		"--storage.tsdb.min-block-duration=" + blockDuration,
+		"--storage.tsdb.max-block-duration=" + blockDuration,
 		fmt.Sprintf("--web.listen-address=:%d", c.HTTPPort),
 		"--web.enable-remote-write-receiver",
 		"--log.level=warn",

@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +34,8 @@ func main() {
 		cmdQuery(os.Args[2:])
 	case "seed":
 		cmdSeed(os.Args[2:])
+	case "backfill":
+		cmdBackfill(os.Args[2:])
 	case "stats":
 		cmdStats(os.Args[2:])
 	case "info":
@@ -55,7 +59,8 @@ Commands:
   build     Build Thanos and Prometheus from local source directories
   start     Start the Thanos pipeline (Prometheus + Sidecar + Querier)
   query     Execute a PromQL query and show resource metrics
-  seed      Generate and inject test data
+  seed      Generate and inject test data via remote write
+  backfill  Create TSDB blocks with historical data for Store Gateway
   stats     Show current resource stats for all components
   info      Show harness configuration and state
   help      Show this help message
@@ -75,6 +80,15 @@ Examples:
 
   # Start with explicit binary paths
   thanos-harness start --prometheus=/path/to/prometheus --thanos=/path/to/thanos
+
+  # Start with per-component memory limit
+  thanos-harness start --memory-limit=1G
+
+  # Tune Go GC (GOGC=50 means collect at 50% heap growth instead of 100%)
+  thanos-harness start --gogc=50 --gomemlimit=512M
+
+  # Enable Store Gateway with object store config
+  thanos-harness start --objstore-config=/path/to/objstore.yaml
 
   # Generate test data
   thanos-harness seed --series=10000 --duration=1h
@@ -216,6 +230,15 @@ func cmdStart(args []string) {
 	promBinary := fs.String("prometheus", "", "Path to prometheus binary (auto-detects from workspace/bin)")
 	thanosBinary := fs.String("thanos", "", "Path to thanos binary (auto-detects from workspace/bin)")
 	basePort := fs.Int("port", 19090, "Starting port number")
+	memoryLimit := fs.String("memory-limit", "", "Per-component memory limit (e.g., 512M, 1G, 2G)")
+	gogc := fs.Int("gogc", 0, "GOGC value for Go runtime (0 = default 100)")
+	gomemlimit := fs.String("gomemlimit", "", "GOMEMLIMIT for Go runtime (e.g., 512M, 1G)")
+	objstoreConfig := fs.String("objstore-config", "", "Path to object store config file (enables Store Gateway)")
+	objstoreCACert := fs.String("objstore-ca-cert", "", "Path to CA cert for object store TLS (copied to local dir)")
+	objstorePrefix := fs.String("objstore-prefix", "", "Override storage prefix/path in object store config")
+	tsdbBlockDuration := fs.String("tsdb-block-duration", "", "TSDB block duration (default 2h, use shorter for testing)")
+	distributedMode := fs.Bool("distributed", false, "Run in distributed mode with leaf and root queriers")
+	numInstances := fs.Int("instances", 1, "Number of Prometheus+Sidecar instances (requires --distributed)")
 	fs.Parse(args)
 
 	// Auto-detect binaries if not specified
@@ -262,11 +285,40 @@ func cmdStart(args []string) {
 		}
 	}
 
+	var memLimitBytes int64
+	if *memoryLimit != "" {
+		var err error
+		memLimitBytes, err = parseMemorySize(*memoryLimit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid memory limit: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	var goMemLimitBytes int64
+	if *gomemlimit != "" {
+		var err error
+		goMemLimitBytes, err = parseMemorySize(*gomemlimit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid GOMEMLIMIT: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	cfg := harness.Config{
 		BaseDir:          *baseDir,
 		PrometheusBinary: *promBinary,
 		ThanosBinary:     *thanosBinary,
 		BasePort:         *basePort,
+		MemoryLimit:      memLimitBytes,
+		GOGC:             *gogc,
+		GOMEMLIMIT:       goMemLimitBytes,
+		ObjStoreConfig:    *objstoreConfig,
+		ObjStoreCACert:    *objstoreCACert,
+		ObjStorePrefix:    *objstorePrefix,
+		TSDBBlockDuration: *tsdbBlockDuration,
+		DistributedMode:   *distributedMode,
+		NumInstances:      *numInstances,
 	}
 
 	h, err := harness.New(cfg)
@@ -286,10 +338,33 @@ func cmdStart(args []string) {
 
 	info := h.Info()
 	fmt.Printf("\nPipeline running:\n")
-	fmt.Printf("  Prometheus: %s\n", h.PrometheusURL())
-	fmt.Printf("  Querier:    %s\n", h.QuerierURL())
+	if h.NumInstances() == 1 {
+		fmt.Printf("  Prometheus: %s\n", h.PrometheusURL())
+	} else {
+		for _, inst := range h.Instances() {
+			fmt.Printf("  Prometheus (%s): http://localhost:%d\n", inst.Name, inst.PrometheusHTTPPort)
+		}
+	}
+	if h.DistributedMode() {
+		fmt.Printf("  Querier (leaf): %s\n", h.LeafQuerierURL())
+		fmt.Printf("  Querier (root): %s\n", h.RootQuerierURL())
+	} else {
+		fmt.Printf("  Querier:    %s\n", h.QuerierURL())
+	}
+	if h.StoreEnabled() {
+		fmt.Printf("  Store:      %s\n", h.StoreURL())
+	}
 	fmt.Printf("  Data dir:   %s\n", cfg.BaseDir)
 	fmt.Printf("  Cgroup v%d:  %v\n", h.Manager().CgroupVersion(), info["scopes_enabled"])
+	if cfg.MemoryLimit > 0 {
+		fmt.Printf("  Memory limit: %s per component\n", process.FormatBytes(cfg.MemoryLimit))
+	}
+	if cfg.GOGC > 0 {
+		fmt.Printf("  GOGC: %d\n", cfg.GOGC)
+	}
+	if cfg.GOMEMLIMIT > 0 {
+		fmt.Printf("  GOMEMLIMIT: %s\n", process.FormatBytes(cfg.GOMEMLIMIT))
+	}
 	fmt.Printf("\nPress Ctrl+C to stop...\n")
 
 	// Wait for interrupt
@@ -357,41 +432,54 @@ func cmdQuery(args []string) {
 func cmdSeed(args []string) {
 	fs := flag.NewFlagSet("seed", flag.ExitOnError)
 	basePort := fs.Int("port", 19090, "Base port (Prometheus port)")
-	numSeries := fs.Int("series", 1000, "Number of unique series")
+	numInstances := fs.Int("instances", 1, "Number of instances to seed (uses port, port+10, port+20, ...)")
+	numSeries := fs.Int("series", 1000, "Number of unique series per instance")
 	duration := fs.Duration("duration", 1*time.Hour, "Duration of data to generate")
 	metricName := fs.String("metric", "test_metric", "Base metric name")
 	withInfo := fs.Bool("info", false, "Generate info metrics for join testing")
 	fs.Parse(args)
 
-	cfg := datagen.Config{
-		NumSeries:        *numSeries,
-		MetricName:       *metricName,
-		LabelNames:       []string{"instance", "job", "env"},
-		LabelCardinality: []int{*numSeries / 10, 10, 3}, // Rough distribution
-		SampleInterval:   15 * time.Second,
-		Duration:         *duration,
+	// Build list of Prometheus URLs based on instance count
+	var prometheusURLs []string
+	for i := 0; i < *numInstances; i++ {
+		port := *basePort + i*10
+		prometheusURLs = append(prometheusURLs, fmt.Sprintf("http://localhost:%d", port))
 	}
-
-	if *withInfo {
-		cfg.InfoMetrics = []datagen.InfoMetricConfig{
-			{
-				Name:       "instance_info",
-				JoinLabel:  "instance",
-				InfoLabels: map[string]string{"node": "node", "region": "us-east"},
-			},
-		}
-	}
-
-	gen := datagen.NewGenerator(cfg)
-
-	fmt.Printf("Generating %d series over %v...\n", gen.SeriesCount(), *duration)
 
 	ctx := context.Background()
-	prometheusURL := fmt.Sprintf("http://localhost:%d", *basePort)
 
-	if err := gen.GenerateRemoteWrite(ctx, prometheusURL); err != nil {
-		fmt.Fprintf(os.Stderr, "Seed failed: %v\n", err)
-		os.Exit(1)
+	for i, promURL := range prometheusURLs {
+		cfg := datagen.Config{
+			NumSeries:        *numSeries,
+			MetricName:       *metricName,
+			LabelNames:       []string{"instance", "job", "env"},
+			LabelCardinality: []int{*numSeries / 10, 10, 3}, // Rough distribution
+			SampleInterval:   15 * time.Second,
+			Duration:         *duration,
+		}
+
+		if *withInfo {
+			cfg.InfoMetrics = []datagen.InfoMetricConfig{
+				{
+					Name:       "instance_info",
+					JoinLabel:  "instance",
+					InfoLabels: map[string]string{"node": "node", "region": "us-east"},
+				},
+			}
+		}
+
+		gen := datagen.NewGenerator(cfg)
+
+		if *numInstances > 1 {
+			fmt.Printf("Seeding instance %d (%s): %d series over %v...\n", i, promURL, gen.SeriesCount(), *duration)
+		} else {
+			fmt.Printf("Generating %d series over %v...\n", gen.SeriesCount(), *duration)
+		}
+
+		if err := gen.GenerateRemoteWrite(ctx, promURL); err != nil {
+			fmt.Fprintf(os.Stderr, "Seed failed for %s: %v\n", promURL, err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("Done.")
@@ -448,4 +536,229 @@ func cmdInfo(args []string) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	enc.Encode(info)
+}
+
+func cmdBackfill(args []string) {
+	fs := flag.NewFlagSet("backfill", flag.ExitOnError)
+	bucketDir := fs.String("bucket", "/tmp/thanos-bucket", "Object store bucket directory")
+	numSeries := fs.Int("series", 1000, "Number of unique series per instance")
+	numInstances := fs.Int("instances", 1, "Number of instances to create data for (uses cluster-0, cluster-1, ...)")
+	duration := fs.Duration("duration", 24*time.Hour, "Duration of historical data")
+	endTime := fs.String("end", "", "End time (RFC3339, default: now)")
+	metricName := fs.String("metric", "test_metric", "Base metric name")
+	promtoolPath := fs.String("promtool", "", "Path to promtool binary (auto-detects)")
+	labels := fs.String("labels", "", "Extra labels as key=value,key=value")
+	churnRate := fs.Float64("churn-rate", 0, "Fraction of churnable series to replace per churn-interval (0-1, e.g., 0.1 = 10%)")
+	churnInterval := fs.Duration("churn-interval", 5*time.Minute, "How often to apply churn (series turnover happens at this interval)")
+	churnFraction := fs.Float64("churn-fraction", 0.5, "Fraction of series that can churn (0-1), rest are stable")
+	fs.Parse(args)
+
+	// Auto-detect promtool
+	if *promtoolPath == "" {
+		wd, _ := os.Getwd()
+		workspaceRoot := findWorkspaceRoot(wd)
+		if workspaceRoot != "" {
+			candidates := []string{
+				filepath.Join(workspaceRoot, "thanos-prometheus", "promtool"),
+				filepath.Join(workspaceRoot, "bin", "promtool"),
+			}
+			for _, c := range candidates {
+				if _, err := os.Stat(c); err == nil {
+					*promtoolPath = c
+					break
+				}
+			}
+		}
+		if *promtoolPath == "" {
+			*promtoolPath = "promtool" // Try PATH
+		}
+	}
+
+	// Parse end time
+	var end time.Time
+	if *endTime == "" {
+		end = time.Now()
+	} else {
+		var err error
+		end, err = time.Parse(time.RFC3339, *endTime)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid end time: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	start := end.Add(-*duration)
+
+	// Parse extra labels
+	extraLabels := make(map[string]string)
+	if *labels != "" {
+		for _, pair := range strings.Split(*labels, ",") {
+			parts := strings.SplitN(pair, "=", 2)
+			if len(parts) == 2 {
+				extraLabels[parts[0]] = parts[1]
+			}
+		}
+	}
+
+	// Ensure bucket directory exists
+	if err := os.MkdirAll(*bucketDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create bucket dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Generate data for each instance
+	totalBlocks := 0
+	for inst := 0; inst < *numInstances; inst++ {
+		instanceName := fmt.Sprintf("cluster-%d", inst)
+		if *numInstances > 1 {
+			fmt.Printf("\n=== Instance %s ===\n", instanceName)
+		}
+
+		// Build instance-specific labels
+		instanceLabels := make(map[string]string)
+		for k, v := range extraLabels {
+			instanceLabels[k] = v
+		}
+		if *numInstances > 1 {
+			instanceLabels["cluster"] = instanceName
+		}
+		instanceLabels["prometheus"] = fmt.Sprintf("prometheus-%s", instanceName)
+		instanceLabels["replica"] = "0"
+
+		blocks, err := generateBackfillBlocks(*promtoolPath, *bucketDir, *numSeries, start, end, *metricName, instanceLabels, *churnRate, *churnInterval, *churnFraction)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to generate blocks for %s: %v\n", instanceName, err)
+			os.Exit(1)
+		}
+		totalBlocks += blocks
+	}
+
+	fmt.Printf("\nDone. Created %d total blocks in %s\n", totalBlocks, *bucketDir)
+	fmt.Println("Store Gateway will sync these blocks on next refresh (default 3m)")
+}
+
+// generateBackfillBlocks generates TSDB blocks with promtool and injects Thanos metadata
+func generateBackfillBlocks(promtoolPath, bucketDir string, numSeries int, start, end time.Time, metricName string, thanosLabels map[string]string, churnRate float64, churnInterval time.Duration, churnFraction float64) (int, error) {
+	duration := end.Sub(start)
+
+	// Configure generator
+	cfg := datagen.Config{
+		NumSeries:        numSeries,
+		MetricName:       metricName,
+		LabelNames:       []string{"instance", "job", "env"},
+		LabelCardinality: []int{numSeries / 10, 10, 3},
+		SampleInterval:   60 * time.Second,
+		Duration:         duration,
+		ChurnRate:        churnRate,
+		ChurnInterval:    churnInterval,
+		ChurnFraction:    churnFraction,
+	}
+
+	gen := datagen.NewGenerator(cfg)
+
+	fmt.Printf("Generating %d series from %s to %s...\n",
+		gen.SeriesCount(), start.Format(time.RFC3339), end.Format(time.RFC3339))
+
+	// Generate OpenMetrics data
+	data, err := gen.GenerateOpenMetrics(start, end)
+	if err != nil {
+		return 0, fmt.Errorf("generate data: %w", err)
+	}
+
+	// Write to temp file
+	tmpFile, err := os.CreateTemp("", "backfill-*.txt")
+	if err != nil {
+		return 0, fmt.Errorf("create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(data); err != nil {
+		return 0, fmt.Errorf("write data: %w", err)
+	}
+	tmpFile.Close()
+
+	// Count existing blocks before running promtool
+	existingBlocks := make(map[string]bool)
+	entries, _ := os.ReadDir(bucketDir)
+	for _, e := range entries {
+		if e.IsDir() && len(e.Name()) == 26 {
+			existingBlocks[e.Name()] = true
+		}
+	}
+
+	// Run promtool to create blocks
+	fmt.Printf("Creating TSDB blocks with promtool...\n")
+	cmd := exec.Command(promtoolPath, "tsdb", "create-blocks-from", "openmetrics",
+		tmpFile.Name(), bucketDir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("promtool failed: %w", err)
+	}
+
+	// Find new blocks and inject Thanos metadata
+	entries, _ = os.ReadDir(bucketDir)
+	newBlockCount := 0
+	for _, e := range entries {
+		if e.IsDir() && len(e.Name()) == 26 && !existingBlocks[e.Name()] {
+			newBlockCount++
+			metaPath := filepath.Join(bucketDir, e.Name(), "meta.json")
+			if err := injectThanosMetadata(metaPath, thanosLabels); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to inject Thanos metadata for %s: %v\n", e.Name(), err)
+			}
+		}
+	}
+
+	return newBlockCount, nil
+}
+
+// injectThanosMetadata adds the required Thanos section to a block's meta.json
+func injectThanosMetadata(metaPath string, labels map[string]string) error {
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return err
+	}
+
+	var meta map[string]interface{}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return err
+	}
+
+	// Add Thanos section
+	meta["thanos"] = map[string]interface{}{
+		"labels":     labels,
+		"downsample": map[string]interface{}{"resolution": 0},
+		"source":     "backfill",
+	}
+
+	// Write back with proper formatting
+	output, err := json.MarshalIndent(meta, "", "\t")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(metaPath, output, 0644)
+}
+
+func parseMemorySize(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	s = strings.ToUpper(strings.TrimSpace(s))
+	var multiplier int64 = 1
+	if strings.HasSuffix(s, "G") || strings.HasSuffix(s, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "GB"), "G")
+	} else if strings.HasSuffix(s, "M") || strings.HasSuffix(s, "MB") {
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "MB"), "M")
+	} else if strings.HasSuffix(s, "K") || strings.HasSuffix(s, "KB") {
+		multiplier = 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "KB"), "K")
+	}
+	var value int64
+	if _, err := fmt.Sscanf(s, "%d", &value); err != nil {
+		return 0, fmt.Errorf("invalid size format: %s", s)
+	}
+	return value * multiplier, nil
 }

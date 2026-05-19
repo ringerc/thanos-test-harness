@@ -28,6 +28,11 @@ type Config struct {
 	// Time settings
 	SampleInterval time.Duration // Interval between samples
 	Duration       time.Duration // Total duration to generate
+
+	// Churn settings (for high-cardinality testing)
+	ChurnRate     float64       // Fraction of churnable series replaced per ChurnInterval (0-1)
+	ChurnInterval time.Duration // How often churn occurs (default: 5m)
+	ChurnFraction float64       // Fraction of all series that can churn (0-1), rest are stable
 }
 
 // InfoMetricConfig configures an info metric for join testing.
@@ -235,4 +240,174 @@ func labelsToString(labels []prompb.Label) string {
 		}
 	}
 	return strings.Join(parts, ",")
+}
+
+// GenerateOpenMetrics generates data in OpenMetrics format for promtool backfill.
+// Returns the generated text and the time range covered.
+func (g *Generator) GenerateOpenMetrics(startTime, endTime time.Time) (string, error) {
+	var buf bytes.Buffer
+
+	// Write TYPE and HELP for each metric
+	buf.WriteString(fmt.Sprintf("# HELP %s Test metric for backfill\n", g.config.MetricName))
+	buf.WriteString(fmt.Sprintf("# TYPE %s gauge\n", g.config.MetricName))
+
+	// Handle churn if configured
+	if g.config.ChurnRate > 0 && g.config.ChurnInterval > 0 {
+		g.generateOpenMetricsWithChurn(&buf, startTime, endTime)
+	} else {
+		g.generateOpenMetricsStatic(&buf, startTime, endTime)
+	}
+
+	// OpenMetrics requires EOF marker
+	buf.WriteString("# EOF\n")
+
+	return buf.String(), nil
+}
+
+// generateOpenMetricsStatic generates samples without churn (all series live for entire duration)
+func (g *Generator) generateOpenMetricsStatic(buf *bytes.Buffer, startTime, endTime time.Time) {
+	seriesLabels := g.generateSeriesLabels()
+
+	currentTime := startTime
+	for currentTime.Before(endTime) || currentTime.Equal(endTime) {
+		for _, labels := range seriesLabels {
+			g.writeOpenMetricsSample(buf, labels, currentTime)
+		}
+		currentTime = currentTime.Add(g.config.SampleInterval)
+	}
+}
+
+// generateOpenMetricsWithChurn generates samples with series churn (labels change over time)
+func (g *Generator) generateOpenMetricsWithChurn(buf *bytes.Buffer, startTime, endTime time.Time) {
+	// Track active series with their lifecycle
+	type seriesLife struct {
+		labels    []prompb.Label
+		startTime time.Time
+		endTime   time.Time
+		churnable bool // Whether this series can be churned
+	}
+
+	// Generate initial series pool
+	baseLabels := g.generateSeriesLabels()
+	churnCounter := 0
+
+	// Determine how many series can churn (default to all if ChurnFraction not set)
+	churnFraction := g.config.ChurnFraction
+	if churnFraction <= 0 {
+		churnFraction = 1.0 // All series can churn by default
+	}
+	numChurnable := int(float64(len(baseLabels)) * churnFraction)
+	if numChurnable < 1 && churnFraction > 0 {
+		numChurnable = 1
+	}
+
+	// Create initial active series - first numChurnable are churnable, rest are stable
+	activeSeries := make([]seriesLife, len(baseLabels))
+	for i, labels := range baseLabels {
+		activeSeries[i] = seriesLife{
+			labels:    labels,
+			startTime: startTime,
+			endTime:   endTime,
+			churnable: i < numChurnable,
+		}
+	}
+
+	// Calculate churn parameters - only apply to churnable series
+	numToChurn := int(float64(numChurnable) * g.config.ChurnRate)
+	if numToChurn < 1 && g.config.ChurnRate > 0 {
+		numToChurn = 1
+	}
+
+	currentTime := startTime
+	lastChurnTime := startTime
+
+	for currentTime.Before(endTime) || currentTime.Equal(endTime) {
+		// Check if it's time to churn
+		if currentTime.Sub(lastChurnTime) >= g.config.ChurnInterval && currentTime.Before(endTime) {
+			// Build list of churnable series indices
+			var churnableIndices []int
+			for i, s := range activeSeries {
+				if s.churnable && (currentTime.Before(s.endTime) || currentTime.Equal(s.endTime)) {
+					churnableIndices = append(churnableIndices, i)
+				}
+			}
+
+			// Churn: end some churnable series and create new ones
+			if len(churnableIndices) > 0 {
+				toChurn := numToChurn
+				if toChurn > len(churnableIndices) {
+					toChurn = len(churnableIndices)
+				}
+				perm := g.rng.Perm(len(churnableIndices))[:toChurn]
+				for _, permIdx := range perm {
+					idx := churnableIndices[permIdx]
+					// End the old series
+					activeSeries[idx].endTime = currentTime
+
+					// Create a new series with modified label
+					newLabels := make([]prompb.Label, len(activeSeries[idx].labels))
+					copy(newLabels, activeSeries[idx].labels)
+
+					// Modify the first non-__name__ label to create a new series
+					for i, l := range newLabels {
+						if l.Name != "__name__" {
+							churnCounter++
+							newLabels[i] = prompb.Label{
+								Name:  l.Name,
+								Value: fmt.Sprintf("%s_churn_%d", l.Value, churnCounter),
+							}
+							break
+						}
+					}
+
+					// Add the new series (also churnable)
+					activeSeries = append(activeSeries, seriesLife{
+						labels:    newLabels,
+						startTime: currentTime,
+						endTime:   endTime,
+						churnable: true,
+					})
+				}
+			}
+			lastChurnTime = currentTime
+		}
+
+		// Write samples for all active series at this timestamp
+		for _, series := range activeSeries {
+			if (currentTime.Equal(series.startTime) || currentTime.After(series.startTime)) &&
+				(currentTime.Equal(series.endTime) || currentTime.Before(series.endTime)) {
+				g.writeOpenMetricsSample(buf, series.labels, currentTime)
+			}
+		}
+
+		currentTime = currentTime.Add(g.config.SampleInterval)
+	}
+}
+
+// writeOpenMetricsSample writes a single sample in OpenMetrics format
+func (g *Generator) writeOpenMetricsSample(buf *bytes.Buffer, labels []prompb.Label, timestamp time.Time) {
+	value := g.generateValue(labels)
+
+	var metricName string
+	var labelParts []string
+	for _, l := range labels {
+		if l.Name == "__name__" {
+			metricName = l.Value
+		} else {
+			labelParts = append(labelParts, fmt.Sprintf(`%s="%s"`, l.Name, l.Value))
+		}
+	}
+
+	if len(labelParts) > 0 {
+		buf.WriteString(fmt.Sprintf("%s{%s} %g %d\n",
+			metricName,
+			strings.Join(labelParts, ","),
+			value,
+			timestamp.UnixMilli()))
+	} else {
+		buf.WriteString(fmt.Sprintf("%s %g %d\n",
+			metricName,
+			value,
+			timestamp.UnixMilli()))
+	}
 }

@@ -11,10 +11,12 @@ import (
 
 // Scope wraps a process in a systemd scope for cgroup isolation.
 type Scope struct {
-	Name    string
-	Cmd     *exec.Cmd
-	pid     int
-	enabled bool
+	Name        string
+	Cmd         *exec.Cmd
+	pid         int
+	enabled     bool
+	memoryLimit int64  // Memory limit in bytes (0 = unlimited)
+	cgroupPath  string // Path to cgroup for manual limits
 }
 
 // NewScope creates a scope wrapper. If systemd is not available, it falls back to plain exec.
@@ -23,6 +25,16 @@ func NewScope(name string) *Scope {
 		Name:    name,
 		enabled: systemdAvailable(),
 	}
+}
+
+// SetMemoryLimit sets a memory limit in bytes. Must be called before Start.
+func (s *Scope) SetMemoryLimit(bytes int64) {
+	s.memoryLimit = bytes
+}
+
+// MemoryLimit returns the configured memory limit in bytes (0 = unlimited).
+func (s *Scope) MemoryLimit() int64 {
+	return s.memoryLimit
 }
 
 // Start executes the command within a systemd scope (or plain exec if unavailable).
@@ -38,8 +50,15 @@ func (s *Scope) startWithScope(ctx context.Context, command string, args []strin
 		"--scope",
 		"--unit=" + s.Name,
 		"--slice=thanos-harness.slice",
-		command,
 	}
+
+	// Add memory limit if configured
+	if s.memoryLimit > 0 {
+		scopeArgs = append(scopeArgs, fmt.Sprintf("--property=MemoryMax=%d", s.memoryLimit))
+		scopeArgs = append(scopeArgs, "--property=MemorySwapMax=0") // Prevent swap to make limits strict
+	}
+
+	scopeArgs = append(scopeArgs, command)
 	scopeArgs = append(scopeArgs, args...)
 
 	s.Cmd = exec.CommandContext(ctx, "systemd-run", scopeArgs...)
@@ -56,6 +75,11 @@ func (s *Scope) startWithScope(ctx context.Context, command string, args []strin
 }
 
 func (s *Scope) startPlain(ctx context.Context, command string, args []string, env []string, dir string) error {
+	// If memory limit is set, start inside cgroup from the beginning
+	if s.memoryLimit > 0 {
+		return s.startInCgroup(ctx, command, args, env, dir)
+	}
+
 	s.Cmd = exec.CommandContext(ctx, command, args...)
 	s.Cmd.Env = append(os.Environ(), env...)
 	s.Cmd.Dir = dir
@@ -68,6 +92,77 @@ func (s *Scope) startPlain(ctx context.Context, command string, args []string, e
 	s.pid = s.Cmd.Process.Pid
 	return nil
 }
+
+func (s *Scope) startInCgroup(ctx context.Context, command string, args []string, env []string, dir string) error {
+	cgroupBase := "/sys/fs/cgroup/thanos-harness"
+	s.cgroupPath = fmt.Sprintf("%s/%s", cgroupBase, s.Name)
+
+	// Set up cgroup with memory limit before starting process
+	if err := s.setupCgroup(); err != nil {
+		return fmt.Errorf("setup cgroup: %w", err)
+	}
+
+	// Build wrapper script that moves shell into cgroup then execs the command
+	// This ensures the process starts inside the cgroup with memory accounting from the beginning
+	uid := os.Getuid()
+	gid := os.Getgid()
+	procsPath := fmt.Sprintf("%s/cgroup.procs", s.cgroupPath)
+
+	// Use sudo to run a shell that: moves itself to cgroup, drops to user, execs command
+	wrapperScript := fmt.Sprintf(
+		"echo $$ > %s && exec setpriv --reuid=%d --regid=%d --init-groups %s %s",
+		procsPath, uid, gid, command, strings.Join(args, " "),
+	)
+
+	s.Cmd = exec.CommandContext(ctx, "sudo", "sh", "-c", wrapperScript)
+	s.Cmd.Env = append(os.Environ(), env...)
+	s.Cmd.Dir = dir
+	s.Cmd.Stdout = os.Stdout
+	s.Cmd.Stderr = os.Stderr
+
+	if err := s.Cmd.Start(); err != nil {
+		return fmt.Errorf("start process in cgroup %s: %w", s.Name, err)
+	}
+	s.pid = s.Cmd.Process.Pid
+	return nil
+}
+
+func (s *Scope) setupCgroup() error {
+	cgroupBase := "/sys/fs/cgroup/thanos-harness"
+
+	// Create parent cgroup
+	if err := exec.Command("sudo", "mkdir", "-p", cgroupBase).Run(); err != nil {
+		return fmt.Errorf("mkdir cgroup base: %w", err)
+	}
+
+	// Enable memory controller
+	subtreeCtl := fmt.Sprintf("%s/cgroup.subtree_control", cgroupBase)
+	cmd := exec.Command("sudo", "tee", subtreeCtl)
+	cmd.Stdin = strings.NewReader("+memory")
+	cmd.Run()
+
+	// Create child cgroup
+	if err := exec.Command("sudo", "mkdir", "-p", s.cgroupPath).Run(); err != nil {
+		return fmt.Errorf("mkdir cgroup: %w", err)
+	}
+
+	// Set memory limit
+	memMaxPath := fmt.Sprintf("%s/memory.max", s.cgroupPath)
+	cmd = exec.Command("sudo", "tee", memMaxPath)
+	cmd.Stdin = strings.NewReader(fmt.Sprintf("%d", s.memoryLimit))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("set memory.max: %w", err)
+	}
+
+	// Disable swap
+	memSwapPath := fmt.Sprintf("%s/memory.swap.max", s.cgroupPath)
+	swapCmd := exec.Command("sudo", "tee", memSwapPath)
+	swapCmd.Stdin = strings.NewReader("0")
+	swapCmd.Run()
+
+	return nil
+}
+
 
 // Stop terminates the process gracefully, then forcefully if needed.
 func (s *Scope) Stop() error {

@@ -23,14 +23,15 @@ type Component struct {
 
 // ComponentConfig holds configuration for starting a component.
 type ComponentConfig struct {
-	Name       string
-	Command    string
-	Args       []string
-	Env        []string
-	Dir        string
-	HTTPPort   int
-	GRPCPort   int
-	HealthPath string // HTTP path for health check, e.g., "/-/ready"
+	Name        string
+	Command     string
+	Args        []string
+	Env         []string
+	Dir         string
+	HTTPPort    int
+	GRPCPort    int
+	HealthPath  string // HTTP path for health check, e.g., "/-/ready"
+	MemoryLimit int64  // Memory limit in bytes (0 = unlimited)
 }
 
 // Manager manages the lifecycle of multiple components.
@@ -60,6 +61,9 @@ func (m *Manager) Start(ctx context.Context, cfg ComponentConfig) (*Component, e
 	}
 
 	scope := NewScope("thanos-harness-" + cfg.Name)
+	if cfg.MemoryLimit > 0 {
+		scope.SetMemoryLimit(cfg.MemoryLimit)
+	}
 	if err := scope.Start(ctx, cfg.Command, cfg.Args, cfg.Env, cfg.Dir); err != nil {
 		return nil, fmt.Errorf("start component %s: %w", cfg.Name, err)
 	}

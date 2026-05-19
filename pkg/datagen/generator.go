@@ -399,15 +399,15 @@ func (g *Generator) writeOpenMetricsSample(buf *bytes.Buffer, labels []prompb.La
 	}
 
 	if len(labelParts) > 0 {
-		buf.WriteString(fmt.Sprintf("%s{%s} %g %d\n",
+		buf.WriteString(fmt.Sprintf("%s{%s} %g %.3f\n",
 			metricName,
 			strings.Join(labelParts, ","),
 			value,
-			timestamp.UnixMilli()))
+			float64(timestamp.UnixMilli())/1000.0))
 	} else {
-		buf.WriteString(fmt.Sprintf("%s %g %d\n",
+		buf.WriteString(fmt.Sprintf("%s %g %.3f\n",
 			metricName,
 			value,
-			timestamp.UnixMilli()))
+			float64(timestamp.UnixMilli())/1000.0))
 	}
 }

@@ -40,6 +40,8 @@ func main() {
 		cmdStats(os.Args[2:])
 	case "info":
 		cmdInfo(os.Args[2:])
+	case "clean":
+		cmdClean(os.Args[2:])
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -63,6 +65,7 @@ Commands:
   backfill  Create TSDB blocks with historical data for Store Gateway
   stats     Show current resource stats for all components
   info      Show harness configuration and state
+  clean     Remove harness data directories and bucket storage
   help      Show this help message
 
 Examples:
@@ -761,4 +764,35 @@ func parseMemorySize(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid size format: %s", s)
 	}
 	return value * multiplier, nil
+}
+
+func cmdClean(args []string) {
+	fs := flag.NewFlagSet("clean", flag.ExitOnError)
+	bucket := fs.String("bucket", "/tmp/thanos-bucket", "Object store bucket directory to clean")
+	all := fs.Bool("all", false, "Clean everything (harness data + bucket)")
+	fs.Parse(args)
+
+	harnessDir := "/tmp/thanos-harness"
+
+	// Clean harness data directory
+	if info, err := os.Stat(harnessDir); err == nil && info.IsDir() {
+		fmt.Printf("Removing harness data: %s\n", harnessDir)
+		if err := os.RemoveAll(harnessDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove %s: %v\n", harnessDir, err)
+		}
+	}
+
+	// Clean bucket if --all or --bucket specified
+	if *all || fs.NFlag() > 0 {
+		if info, err := os.Stat(*bucket); err == nil && info.IsDir() {
+			fmt.Printf("Removing bucket data: %s\n", *bucket)
+			if err := os.RemoveAll(*bucket); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to remove %s: %v\n", *bucket, err)
+			}
+			// Recreate empty bucket directory
+			os.MkdirAll(*bucket, 0755)
+		}
+	}
+
+	fmt.Println("Clean complete")
 }

@@ -97,7 +97,13 @@ Examples:
   thanos-harness seed --series=10000 --duration=1h
 
   # Run a query with resource tracking
-  thanos-harness query 'count(test_metric)'`)
+  thanos-harness query 'count(test_metric)'
+
+  # Run a query with memory profiling (high-frequency RSS + pprof sampling)
+  thanos-harness query --profile 'avg_over_time(test_metric[6h])'
+
+  # Custom profiling interval (default 10ms)
+  thanos-harness query --profile --profile-interval=5ms 'sum(rate(test_metric[5m]))'`)
 }
 
 func cmdBuild(args []string) {
@@ -387,6 +393,8 @@ func cmdQuery(args []string) {
 	baseDir := fs.String("dir", "/tmp/thanos-harness", "Base directory")
 	basePort := fs.Int("port", 19090, "Base port")
 	outputJSON := fs.Bool("json", false, "Output as JSON")
+	profile := fs.Bool("profile", false, "Enable memory profiling during query execution")
+	profileInterval := fs.Duration("profile-interval", 10*time.Millisecond, "Memory sampling interval for profiling")
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
@@ -403,7 +411,15 @@ func cmdQuery(args []string) {
 	h, _ := harness.New(cfg)
 	ctx := context.Background()
 
-	result, err := h.Query(ctx, query)
+	var result *harness.QueryResult
+	var err error
+
+	if *profile {
+		result, err = h.QueryWithProfile(ctx, query, *profileInterval)
+	} else {
+		result, err = h.Query(ctx, query)
+	}
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
@@ -428,6 +444,11 @@ func cmdQuery(args []string) {
 				process.FormatBytes(stats.MemoryUsage),
 				process.FormatBytes(stats.MemoryMax))
 			fmt.Printf("    CPU: %dms\n", stats.CPUUsageUsec/1000)
+		}
+
+		// Print profiling results if available
+		if result.MemoryProfile != nil {
+			fmt.Println("\n" + result.MemoryProfile.Summary())
 		}
 	}
 }

@@ -507,3 +507,64 @@ prometheus:
 
 4. **Recommendation**: For high-churn workloads at this scale, allocate at least
    20-25GB memory per Store Gateway instance to handle block loading spikes.
+<<<<<<< HEAD:results/churn-memory-test-aggressive-2026-05-19.md
+=======
+
+## Reproduction
+
+### Data Generation
+
+```bash
+# Clean previous test data
+./thanos-harness clean --all
+
+# Generate aggressive churn dataset
+./thanos-harness backfill --series=10000 --duration=12h \
+  --churn-rate=0.5 --churn-fraction=0.8 --churn-interval=5m
+
+# Start components with 10GB memory limit
+./thanos-harness start --objstore-config=configs/objstore-filesystem.yaml \
+  --memory-limit=10G
+```
+
+### Queries Executed
+
+All queries run via curl against Thanos Querier API with explicit historical timestamps.
+
+**Instant queries (at t = now-6h):**
+```bash
+# Count all series
+curl -s "http://localhost:9090/api/v1/query?query=count(test_metric)&time=$(date -d '-6 hours' +%s)"
+
+# Sum by instance
+curl -s "http://localhost:9090/api/v1/query?query=sum%20by%20(instance)%20(test_metric)&time=$(date -d '-6 hours' +%s)"
+
+# Count by all labels
+curl -s "http://localhost:9090/api/v1/query?query=count%20by%20(instance,%20job,%20env)%20(test_metric)&time=$(date -d '-6 hours' +%s)"
+
+# Count churned series only
+curl -s "http://localhost:9090/api/v1/query?query=count(test_metric{instance=~\".*churn.*\"})&time=$(date -d '-6 hours' +%s)"
+```
+
+**Range queries:**
+```bash
+# 6h range, 60s step - count
+curl -s "http://localhost:9090/api/v1/query_range?query=count(test_metric)&start=$(date -d '-12 hours' +%s)&end=$(date -d '-6 hours' +%s)&step=60s"
+
+# 12h range, 60s step - count
+curl -s "http://localhost:9090/api/v1/query_range?query=count(test_metric)&start=$(date -d '-18 hours' +%s)&end=$(date -d '-6 hours' +%s)&step=60s"
+
+# 12h range, 15s step - fine granularity (slow)
+curl -s "http://localhost:9090/api/v1/query_range?query=count(test_metric)&start=$(date -d '-18 hours' +%s)&end=$(date -d '-6 hours' +%s)&step=15s"
+
+# 6h range - high cardinality output (292k series)
+curl -s "http://localhost:9090/api/v1/query_range?query=sum%20by%20(instance)%20(test_metric)&start=$(date -d '-12 hours' +%s)&end=$(date -d '-6 hours' +%s)&step=60s"
+```
+
+### Memory Monitoring
+
+```bash
+# Check resource usage
+./thanos-harness stats
+```
+>>>>>>> 4b61a33 (feat(harness): add memory profiler with corrected PID tracking):test-harness/results/churn-memory-test-aggressive-2026-05-19.md

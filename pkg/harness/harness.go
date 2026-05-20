@@ -13,6 +13,7 @@ import (
 
 	"github.com/thanos-workspace/test-harness/pkg/components"
 	"github.com/thanos-workspace/test-harness/pkg/process"
+	"github.com/thanos-workspace/test-harness/pkg/profiler"
 	"gopkg.in/yaml.v3"
 )
 
@@ -410,6 +411,8 @@ type QueryResult struct {
 	Error       string                          `json:"error,omitempty"`
 	ResultCount int                             `json:"result_count"`
 	Stats       map[string]*process.CgroupStats `json:"component_stats"`
+	// Memory profiling results (only populated when using QueryWithProfile)
+	MemoryProfile *profiler.ProfileResult `json:"memory_profile,omitempty"`
 }
 
 // Query executes a PromQL query and returns results with resource metrics.
@@ -546,6 +549,175 @@ func (h *Harness) QueryRange(ctx context.Context, query string, start, end time.
 // GetStats returns current resource stats for all components.
 func (h *Harness) GetStats() map[string]*process.CgroupStats {
 	return h.manager.GetAllStats()
+}
+
+// QueryWithProfile executes a PromQL query with memory profiling.
+// sampleInterval controls how frequently RSS is sampled (e.g., 10ms for high-frequency).
+func (h *Harness) QueryWithProfile(ctx context.Context, query string, sampleInterval time.Duration) (*QueryResult, error) {
+	result := &QueryResult{
+		Query:     query,
+		StartTime: time.Now(),
+	}
+
+	// Set up profiler with all managed processes
+	prof := h.createProfiler(sampleInterval)
+
+	// Collect pre-query stats
+	preStats := h.manager.GetAllStats()
+
+	// Execute query with profiling
+	var resp *http.Response
+	var queryErr error
+
+	profileResult, _ := prof.Profile(ctx, func() error {
+		queryURL := fmt.Sprintf("http://localhost:%d/api/v1/query", h.querierHTTPPort)
+		params := url.Values{}
+		params.Set("query", query)
+
+		var err error
+		resp, err = http.Get(queryURL + "?" + params.Encode())
+		queryErr = err
+		return err
+	})
+
+	result.EndTime = time.Now()
+	result.Duration = result.EndTime.Sub(result.StartTime)
+	result.MemoryProfile = profileResult
+
+	if queryErr != nil {
+		result.Status = "error"
+		result.Error = queryErr.Error()
+		return result, nil
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var apiResp struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string            `json:"resultType"`
+			Result     []json.RawMessage `json:"result"`
+		} `json:"data"`
+		Error string `json:"error"`
+	}
+
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		result.Status = "error"
+		result.Error = "failed to parse response: " + err.Error()
+		return result, nil
+	}
+
+	result.Status = apiResp.Status
+	result.Error = apiResp.Error
+	result.ResultCount = len(apiResp.Data.Result)
+
+	// Collect post-query stats
+	postStats := h.manager.GetAllStats()
+	result.Stats = make(map[string]*process.CgroupStats)
+	for name, post := range postStats {
+		if pre, ok := preStats[name]; ok {
+			delta := *post
+			delta.CPUUsageUsec -= pre.CPUUsageUsec
+			delta.CPUUserUsec -= pre.CPUUserUsec
+			delta.CPUSysUsec -= pre.CPUSysUsec
+			result.Stats[name] = &delta
+		} else {
+			result.Stats[name] = post
+		}
+	}
+
+	return result, nil
+}
+
+// QueryRangeWithProfile executes a range query with memory profiling.
+func (h *Harness) QueryRangeWithProfile(ctx context.Context, query string, start, end time.Time, step time.Duration, sampleInterval time.Duration) (*QueryResult, error) {
+	result := &QueryResult{
+		Query:     query,
+		StartTime: time.Now(),
+	}
+
+	prof := h.createProfiler(sampleInterval)
+	preStats := h.manager.GetAllStats()
+
+	var resp *http.Response
+	var queryErr error
+
+	profileResult, _ := prof.Profile(ctx, func() error {
+		queryURL := fmt.Sprintf("http://localhost:%d/api/v1/query_range", h.querierHTTPPort)
+		params := url.Values{}
+		params.Set("query", query)
+		params.Set("start", fmt.Sprintf("%d", start.Unix()))
+		params.Set("end", fmt.Sprintf("%d", end.Unix()))
+		params.Set("step", step.String())
+
+		var err error
+		resp, err = http.Get(queryURL + "?" + params.Encode())
+		queryErr = err
+		return err
+	})
+
+	result.EndTime = time.Now()
+	result.Duration = result.EndTime.Sub(result.StartTime)
+	result.MemoryProfile = profileResult
+
+	if queryErr != nil {
+		result.Status = "error"
+		result.Error = queryErr.Error()
+		return result, nil
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var apiResp struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string            `json:"resultType"`
+			Result     []json.RawMessage `json:"result"`
+		} `json:"data"`
+		Error string `json:"error"`
+	}
+
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		result.Status = "error"
+		result.Error = "failed to parse response: " + err.Error()
+		return result, nil
+	}
+
+	result.Status = apiResp.Status
+	result.Error = apiResp.Error
+	result.ResultCount = len(apiResp.Data.Result)
+
+	postStats := h.manager.GetAllStats()
+	result.Stats = make(map[string]*process.CgroupStats)
+	for name, post := range postStats {
+		if pre, ok := preStats[name]; ok {
+			delta := *post
+			delta.CPUUsageUsec -= pre.CPUUsageUsec
+			delta.CPUUserUsec -= pre.CPUUserUsec
+			delta.CPUSysUsec -= pre.CPUSysUsec
+			result.Stats[name] = &delta
+		} else {
+			result.Stats[name] = post
+		}
+	}
+
+	return result, nil
+}
+
+// createProfiler creates a profiler configured with all managed processes.
+func (h *Harness) createProfiler(interval time.Duration) *profiler.Profiler {
+	prof := profiler.New(interval)
+
+	// Add all running processes
+	for _, info := range h.manager.ListProcesses() {
+		if info.PID > 0 {
+			prof.AddProcess(info.Name, info.PID, info.HTTPPort)
+		}
+	}
+
+	return prof
 }
 
 // PrometheusURL returns the Prometheus HTTP URL for the first instance.

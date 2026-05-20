@@ -203,6 +203,29 @@ func (m *Manager) List() []string {
 	return names
 }
 
+// ProcessInfo holds basic info about a running process.
+type ProcessInfo struct {
+	Name     string
+	PID      int
+	HTTPPort int
+}
+
+// ListProcesses returns info about all managed processes.
+func (m *Manager) ListProcesses() []ProcessInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	infos := make([]ProcessInfo, 0, len(m.components))
+	for _, comp := range m.components {
+		infos = append(infos, ProcessInfo{
+			Name:     comp.Name,
+			PID:      comp.Scope.PID(),
+			HTTPPort: comp.Config.HTTPPort,
+		})
+	}
+	return infos
+}
+
 // Get returns a component by name.
 func (m *Manager) Get(name string) (*Component, bool) {
 	m.mu.RLock()

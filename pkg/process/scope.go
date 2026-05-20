@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Scope wraps a process in a systemd scope for cgroup isolation.
@@ -123,7 +125,22 @@ func (s *Scope) startInCgroup(ctx context.Context, command string, args []string
 	if err := s.Cmd.Start(); err != nil {
 		return fmt.Errorf("start process in cgroup %s: %w", s.Name, err)
 	}
-	s.pid = s.Cmd.Process.Pid
+
+	// The sudo wrapper PID is not what we want - we need the actual process PID.
+	// Read it from cgroup.procs which contains the PIDs of processes in this cgroup.
+	// The wrapper script moves itself (and thus the exec'd process) into the cgroup.
+	s.pid = s.Cmd.Process.Pid // fallback to wrapper PID
+
+	// Wait briefly for the process to move into the cgroup and exec
+	for i := 0; i < 50; i++ { // 500ms max
+		time.Sleep(10 * time.Millisecond)
+		actualPID, err := s.readActualPIDFromCgroup()
+		if err == nil && actualPID > 0 && actualPID != s.Cmd.Process.Pid {
+			s.pid = actualPID
+			break
+		}
+	}
+
 	return nil
 }
 
@@ -190,6 +207,44 @@ func (s *Scope) Stop() error {
 // PID returns the process ID.
 func (s *Scope) PID() int {
 	return s.pid
+}
+
+// readActualPIDFromCgroup reads the actual process PID from cgroup.procs.
+// When starting via sudo wrapper, the wrapper moves itself into the cgroup,
+// then execs the actual command. This function finds that actual process.
+func (s *Scope) readActualPIDFromCgroup() (int, error) {
+	if s.cgroupPath == "" {
+		return 0, fmt.Errorf("no cgroup path")
+	}
+
+	procsPath := fmt.Sprintf("%s/cgroup.procs", s.cgroupPath)
+	data, err := os.ReadFile(procsPath)
+	if err != nil {
+		return 0, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		pid, err := strconv.Atoi(line)
+		if err != nil {
+			continue
+		}
+		// Return the first PID that's not the sudo wrapper
+		if pid != s.Cmd.Process.Pid {
+			return pid, nil
+		}
+	}
+
+	// If only one PID (the wrapper), return it
+	if len(lines) > 0 {
+		pid, _ := strconv.Atoi(lines[0])
+		return pid, nil
+	}
+
+	return 0, fmt.Errorf("no PIDs in cgroup")
 }
 
 // AttachToPID attaches to an existing process by PID (for state recovery).
